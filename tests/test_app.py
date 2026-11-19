@@ -29,7 +29,7 @@ def event(body='{"id": "https://example.com", "type": "Manifest"}', headers=None
     }
 
 
-def put_event(path, body='{"v": 2}', code=CODE):
+def put_event(path, body='{"id": "https://example.com", "type": "Manifest"}', code=CODE):
     headers = {"x-access-code": code} if code else {}
     return event(body=body, headers=headers, method="PUT", path=path)
 
@@ -41,7 +41,7 @@ def read(s3, key):
 @pytest.fixture
 def existing(with_code):
     """An uploaded file; returns its key (relative to properties/)."""
-    resp = app.handler(event(body='{"v": 1}'), None)
+    resp = app.handler(event(body='{"id": "https://example.com", "type": "Manifest"}'), None)
     assert resp["statusCode"] == 201
     return json.loads(resp["body"])["key"]
 
@@ -58,7 +58,7 @@ def test_valid_code_stores_json(with_code):
     assert KEY_RE.match(key)
     assert result["url"] == f"{PUBLIC_BASE_URL}/{key}"
     obj = with_code.get_object(Bucket=BUCKET, Key=f"properties/{key}")
-    assert json.loads(obj["Body"].read()) == {"hello": "world"}
+    assert json.loads(obj["Body"].read()) == {"id": "https://example.com", "type": "Manifest"}
     assert obj["ContentType"] == "application/json"
     assert obj["CacheControl"] == "public, max-age=60"
 
@@ -101,24 +101,22 @@ def test_url_omitted_without_public_base_url(with_code, monkeypatch):
 
 
 def test_base64_body_is_decoded(with_code):
-    encoded = base64.b64encode(b'{"n": 1}').decode()
+    manifest = {"id": "https://example.com","type": "Manifest"}
+    encoded = base64.b64encode(json.dumps(manifest).encode("utf-8")).decode("ascii")
 
     resp = app.handler(event(body=encoded, b64=True), None)
 
     assert resp["statusCode"] == 201
-    assert read(with_code, json.loads(resp["body"])["key"]) == {"n": 1}
+    assert read(with_code, json.loads(resp["body"])["key"]) == manifest
 
 def test_not_iiif(with_code):
     body = {
         "key": "not IIIF"
     }
 
-    resp = app.handler(event(body=body), None)
+    resp = app.handler(event(body=json.dumps(body)), None)
 
     assert resp["statusCode"] == 400
-    assert read(with_code, json.loads(resp["body"])["key"]) == {"n": 1}
-
-
 
 # --- PUT (update) ----------------------------------------------------------
 
@@ -128,7 +126,7 @@ def test_put_replaces_existing_file(with_code, existing):
 
     assert resp["statusCode"] == 200
     assert json.loads(resp["body"]) == {"key": existing, "url": f"{PUBLIC_BASE_URL}/{existing}"}
-    assert read(with_code, existing) == {"v": 2}
+    assert read(with_code, existing) == {"id": "https://example.com","type": "Manifest"}
     obj = with_code.head_object(Bucket=BUCKET, Key=f"properties/{existing}")
     assert obj["CacheControl"] == "public, max-age=60"
     assert obj["ContentType"] == "application/json"
@@ -138,21 +136,21 @@ def test_put_with_other_propertys_code_is_forbidden(with_code, existing):
     resp = app.handler(put_event(f"/{existing}", code=OTHER_CODE), None)
 
     assert resp["statusCode"] == 403
-    assert read(with_code, existing) == {"v": 1}
+    assert read(with_code, existing) == {"id": "https://example.com","type": "Manifest"}
 
 
 def test_put_with_wrong_code_is_forbidden(with_code, existing):
     resp = app.handler(put_event(f"/{existing}", code="nope"), None)
 
     assert resp["statusCode"] == 403
-    assert read(with_code, existing) == {"v": 1}
+    assert read(with_code, existing) == {"id": "https://example.com","type": "Manifest"}
 
 
 def test_put_without_code_is_unauthorized(with_code, existing):
     resp = app.handler(put_event(f"/{existing}", code=None), None)
 
     assert resp["statusCode"] == 401
-    assert read(with_code, existing) == {"v": 1}
+    assert read(with_code, existing) == {"id": "https://example.com","type": "Manifest"}
 
 
 def test_put_to_missing_file_is_not_found(with_code):
@@ -177,7 +175,7 @@ def test_put_invalid_json_leaves_original(with_code, existing):
     resp = app.handler(put_event(f"/{existing}", body="{nope"), None)
 
     assert resp["statusCode"] == 400
-    assert read(with_code, existing) == {"v": 1}
+    assert read(with_code, existing) == {"id": "https://example.com","type": "Manifest"}
 
 
 @pytest.mark.parametrize("method", ["GET", "DELETE", "PATCH", ""])
@@ -185,4 +183,4 @@ def test_other_methods_not_allowed(with_code, existing, method):
     resp = app.handler(event(method=method, path=f"/{existing}"), None)
 
     assert resp["statusCode"] == 405
-    assert read(with_code, existing) == {"v": 1}
+    assert read(with_code, existing) == {"id": "https://example.com","type": "Manifest"}

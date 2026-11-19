@@ -12,7 +12,7 @@ def upload(code):
         {
             "requestContext": {"http": {"method": "POST"}},
             "headers": {"x-access-code": code},
-            "body": '{"ok": true}',
+            "body": '{"id": "https://example.com","type": "Manifest"}',
         },
         None,
     )
