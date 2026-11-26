@@ -66,7 +66,8 @@ Resources:
   # CloudFront can't route by method, so this viewer-request function does it:
   # OPTIONS -> answered here (CORS preflight), POST/PUT -> the upload Lambda
   # (with the viewer's host in x-public-host, so responses can include the
-  # public URL), GET/HEAD -> S3, anything else -> 405.
+  # public URL, and this distribution's ID in x-distribution-id, so a PUT can
+  # invalidate the cached copy), GET/HEAD -> S3, anything else -> 405.
   RouterFunction:
     Type: AWS::CloudFront::Function
     Properties:
@@ -87,15 +88,20 @@ Resources:
 
         function handler(event) {
           var request = event.request;
+          var context = event.context || {};
           var method = request.method;
           if (method === 'OPTIONS') {
             return { statusCode: 204, statusDescription: 'No Content', headers: CORS };
           }
           if (method === 'POST' || method === 'PUT') {
-            // Always overwrite, so a viewer can't choose the host in returned URLs.
+            // Always overwrite, so a viewer can't choose these values.
             delete request.headers['x-public-host'];
+            delete request.headers['x-distribution-id'];
             if (request.headers.host) {
               request.headers['x-public-host'] = { value: request.headers.host.value };
+            }
+            if (context.distributionId) {
+              request.headers['x-distribution-id'] = { value: context.distributionId };
             }
             cf.selectRequestOriginById('UploadFunctionOrigin');
             return request;
@@ -122,7 +128,7 @@ Resources:
         Name: !Sub "${AWS::StackName}-forward-upload-headers"
         HeadersConfig:
           HeaderBehavior: whitelist
-          Headers: [content-type, x-access-code, x-public-host]
+          Headers: [content-type, x-access-code, x-public-host, x-distribution-id]
         CookiesConfig:
           CookieBehavior: none
         QueryStringsConfig:
@@ -182,7 +188,8 @@ Resources:
           AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
           CachedMethods: [GET, HEAD]
           Compress: true
-          # Honours the objects' Cache-Control: max-age=60, so PUT updates show within a minute.
+          # Honours the objects' Cache-Control (s-maxage=86400 for CloudFront, max-age=0 for
+          # browsers). PUTs invalidate the cached copy, so updates show straight away.
           CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6  # Managed-CachingOptimized
           OriginRequestPolicyId: !Ref ForwardUploadHeadersPolicy
           ResponseHeadersPolicyId: !Ref CorsHeadersPolicy
@@ -245,6 +252,21 @@ Resources:
             - Effect: Allow
               Action: s3:ListBucket
               Resource: !GetAtt DataBucket.Arn
+
+  # A separate policy, not part of UploadFunction's Policies: the distribution
+  # depends on the function's URL, so the function's role can't reference the
+  # distribution without a circular dependency. This one can.
+  UploadFunctionInvalidationPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: invalidate-updated-uploads
+      Roles: [!Ref UploadFunctionRole]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: cloudfront:CreateInvalidation
+            Resource: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribution}"
 
 Outputs:
   FunctionUrl:

@@ -62,8 +62,8 @@ Uploads are served over HTTPS by CloudFront at `https://jsonblob.iiif.io/<proper
 
 - The bucket itself stays private (Block Public Access is on). CloudFront reads it through Origin Access Control, only under `properties/`, so `codes/` and `registry/` can't be reached at all, and nobody can list folder contents.
 - Anyone who has a URL can read that file. The filenames include a random UUID, so they can't be guessed.
-- Files are stored with `Cache-Control: public, max-age=60`, so CloudFront and browsers re-check them at least once a minute.
-- Uploads are deleted 30 days after they were last written, so their URLs stop working then.
+- Files are stored with `Cache-Control: public, max-age=0, s-maxage=86400`. Browsers re-check with CloudFront on every request (usually a cheap `304 Not Modified`), and CloudFront keeps a copy for up to a day. A PUT through the public URL clears CloudFront's copy, so updates show straight away (see below).
+- Uploads are deleted 30 days after they were last written, so their URLs stop working then (or up to a day later, while CloudFront still has a cached copy).
 
 ## Updating uploads
 
@@ -86,17 +86,20 @@ await fetch(url, {
 
 | Status | Meaning |
 | --- | --- |
-| 200 | Replaced. The response is `{"key": ..., "url": ...}` (the same URL) |
+| 200 | Replaced. The response is `{"key": ..., "url": ..., "invalidated": true}` (the same URL). `invalidated` says whether CloudFront's cached copy was cleared |
 | 400 | The body isn't valid JSON (the file is unchanged) |
 | 401 | The `x-access-code` header is missing |
 | 403 | The code isn't recognised, or it belongs to a different property |
 | 404 | No such file. PUT only updates; use POST to create new files |
 | 405 | Methods other than GET, HEAD, POST, PUT and OPTIONS aren't allowed on the public URL |
 
-- Readers see the new version within about 60 seconds, because of the cache lifetime.
+- Readers see the new version straight away. After replacing the file, the Lambda asks CloudFront to invalidate that one path, which usually takes a few seconds. It doesn't wait for this to finish.
+- If the invalidation can't be started, the file is still replaced and the response says `"invalidated": false`. Readers may then see the old version for up to a day. To clear it by hand: `aws cloudfront create-invalidation --distribution-id <id> --paths "/<property>/<file>.json"`.
+- PUTs straight to the Lambda function URL don't invalidate, because the function only learns the distribution's ID from requests that come through CloudFront.
+- Each invalidated path counts towards CloudFront's invalidation allowance: the first 1,000 paths a month are free, then $0.005 per path.
 - A PUT counts as a new write, so it restarts the file's 30-day expiry.
 - Browser POSTs and PUTs from any origin work: CloudFront answers the CORS preflight itself.
-- How it works: CloudFront can't route by HTTP method, so a CloudFront Function (`RouterFunction` in `template.yaml`) sends POSTs and PUTs to the upload Lambda's function URL and GETs and HEADs to S3. For POSTs and PUTs it also passes the host the caller used in an `x-public-host` header, which the Lambda uses to build `url` when no custom domain is configured. `tests/test_router_function.py` runs its logic under Node. To test it in CloudFront's real runtime after deploying, use `aws cloudfront test-function`.
+- How it works: CloudFront can't route by HTTP method, so a CloudFront Function (`RouterFunction` in `template.yaml`) sends POSTs and PUTs to the upload Lambda's function URL and GETs and HEADs to S3. For POSTs and PUTs it also passes the host the caller used in an `x-public-host` header, which the Lambda uses to build `url` when no custom domain is configured, and the distribution's ID in an `x-distribution-id` header, which the Lambda uses to invalidate updated files. It overwrites both headers, so callers can't set them. The function's permission to invalidate is a separate IAM policy (`UploadFunctionInvalidationPolicy`), limited to this one distribution. `tests/test_router_function.py` runs its logic under Node. To test it in CloudFront's real runtime after deploying, use `aws cloudfront test-function`.
 
 ### Custom domain (jsonblob.iiif.io)
 

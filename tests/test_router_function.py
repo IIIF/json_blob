@@ -26,7 +26,8 @@ var results = {};
     host: { value: 'd111.cloudfront.net' },
     'x-public-host': { value: 'spoofed.example' }
   } };
-  var out = handler({ request: request });
+  request.headers['x-distribution-id'] = { value: 'ESPOOFED' };
+  var out = handler({ request: request, context: { distributionId: 'E2TEST' } });
   results[m] = { passthrough: out === request, status: out.statusCode || null,
                  headers: out === request ? null : out.headers, origins: selected,
                  forwarded: out === request ? out.headers : null };
@@ -64,6 +65,28 @@ def test_writes_go_to_upload_function(results, method):
 @pytest.mark.parametrize("method", ["POST", "PUT"])
 def test_writes_pass_viewer_host_not_spoofed_header(results, method):
     assert results[method]["forwarded"]["x-public-host"] == {"value": "d111.cloudfront.net"}
+
+
+@pytest.mark.parametrize("method", ["POST", "PUT"])
+def test_writes_pass_distribution_id_not_spoofed_header(results, method):
+    assert results[method]["forwarded"]["x-distribution-id"] == {"value": "E2TEST"}
+
+
+def test_distribution_id_header_is_forwarded_to_origin():
+    template = yaml_parse(TEMPLATE.read_text())
+    policy = template["Resources"]["ForwardUploadHeadersPolicy"]["Properties"]
+    assert "x-distribution-id" in policy["OriginRequestPolicyConfig"]["HeadersConfig"]["Headers"]
+
+
+def test_upload_function_may_invalidate_its_distribution_only():
+    resources = yaml_parse(TEMPLATE.read_text())["Resources"]
+    policy = resources["UploadFunctionInvalidationPolicy"]["Properties"]
+    assert policy["Roles"] == [{"Ref": "UploadFunctionRole"}]
+    [statement] = policy["PolicyDocument"]["Statement"]
+    assert statement["Action"] == "cloudfront:CreateInvalidation"
+    assert statement["Resource"] == {
+        "Fn::Sub": "arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribution}"
+    }
 
 
 def test_options_answers_preflight(results):

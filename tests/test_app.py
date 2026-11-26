@@ -34,6 +34,30 @@ def put_event(path, body='{"id": "https://example.com", "type": "Manifest"}', co
     return event(body=body, headers=headers, method="PUT", path=path)
 
 
+class FakeCloudFront:
+    def __init__(self, fail=False):
+        self.calls = []
+        self.fail = fail
+
+    def create_invalidation(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.fail:
+            raise RuntimeError("boom")
+        return {"Invalidation": {"Id": "I1", "Status": "InProgress"}}
+
+
+@pytest.fixture
+def cloudfront(monkeypatch):
+    fake = FakeCloudFront()
+    monkeypatch.setattr(app, "get_cloudfront", lambda: fake)
+    return fake
+
+
+def via_cloudfront(ev, distribution_id="E2TEST123"):
+    ev["headers"]["x-distribution-id"] = distribution_id
+    return ev
+
+
 def read(s3, key):
     return json.loads(s3.get_object(Bucket=BUCKET, Key=f"properties/{key}")["Body"].read())
 
@@ -60,7 +84,7 @@ def test_valid_code_stores_json(with_code):
     obj = with_code.get_object(Bucket=BUCKET, Key=f"properties/{key}")
     assert json.loads(obj["Body"].read()) == {"id": "https://example.com", "type": "Manifest"}
     assert obj["ContentType"] == "application/json"
-    assert obj["CacheControl"] == "public, max-age=60"
+    assert obj["CacheControl"] == app.CACHE_CONTROL == "public, max-age=0, s-maxage=86400"
 
 
 def test_wrong_code_is_forbidden(with_code):
@@ -160,10 +184,14 @@ def test_put_replaces_existing_file(with_code, existing):
     resp = app.handler(put_event(f"/{existing}"), None)
 
     assert resp["statusCode"] == 200
-    assert json.loads(resp["body"]) == {"key": existing, "url": f"{PUBLIC_BASE_URL}/{existing}"}
+    assert json.loads(resp["body"]) == {
+        "key": existing,
+        "url": f"{PUBLIC_BASE_URL}/{existing}",
+        "invalidated": False,  # direct call: no distribution ID header
+    }
     assert read(with_code, existing) == {"id": "https://example.com","type": "Manifest"}
     obj = with_code.head_object(Bucket=BUCKET, Key=f"properties/{existing}")
-    assert obj["CacheControl"] == "public, max-age=60"
+    assert obj["CacheControl"] == app.CACHE_CONTROL == "public, max-age=0, s-maxage=86400"
     assert obj["ContentType"] == "application/json"
 
 
@@ -176,6 +204,61 @@ def test_put_url_from_cloudfront_host(with_code, existing, monkeypatch):
 
     assert resp["statusCode"] == 200
     assert json.loads(resp["body"])["url"] == f"https://d111.cloudfront.net/{existing}"
+
+
+def test_put_via_cloudfront_invalidates_cached_copy(with_code, existing, cloudfront):
+    resp = app.handler(via_cloudfront(put_event(f"/{existing}")), None)
+
+    assert resp["statusCode"] == 200
+    assert json.loads(resp["body"])["invalidated"] is True
+    assert len(cloudfront.calls) == 1
+    call = cloudfront.calls[0]
+    assert call["DistributionId"] == "E2TEST123"
+    assert call["InvalidationBatch"]["Paths"] == {"Quantity": 1, "Items": [f"/{existing}"]}
+    assert call["InvalidationBatch"]["CallerReference"]
+
+
+def test_put_invalidation_failure_still_succeeds(with_code, existing, monkeypatch):
+    fake = FakeCloudFront(fail=True)
+    monkeypatch.setattr(app, "get_cloudfront", lambda: fake)
+
+    resp = app.handler(via_cloudfront(put_event(f"/{existing}", body='{"id": "https://new", "type": "Manifest"}')), None)
+
+    assert resp["statusCode"] == 200
+    assert json.loads(resp["body"])["invalidated"] is False
+    assert len(fake.calls) == 1
+    assert read(with_code, existing) == {"id": "https://new", "type": "Manifest"}
+
+
+@pytest.mark.parametrize("distribution_id", ["", "e2lower", "E2/../x", "E" * 33])
+def test_put_with_invalid_distribution_id_does_not_invalidate(with_code, existing, cloudfront, distribution_id):
+    resp = app.handler(via_cloudfront(put_event(f"/{existing}"), distribution_id), None)
+
+    assert resp["statusCode"] == 200
+    assert json.loads(resp["body"])["invalidated"] is False
+    assert cloudfront.calls == []
+
+
+def test_put_without_distribution_id_does_not_invalidate(with_code, existing, cloudfront):
+    resp = app.handler(put_event(f"/{existing}"), None)
+
+    assert json.loads(resp["body"])["invalidated"] is False
+    assert cloudfront.calls == []
+
+
+@pytest.mark.parametrize(
+    "make_event",
+    [
+        lambda key: put_event(f"/{key}", code=OTHER_CODE),          # 403
+        lambda key: put_event("/acme/20260101T000000Z-x.json"),     # 404
+        lambda key: put_event(f"/{key}", body="{nope"),             # 400
+        lambda key: event(),                                        # POST: new file, nothing cached
+    ],
+)
+def test_no_invalidation_unless_put_succeeds(with_code, existing, cloudfront, make_event):
+    app.handler(via_cloudfront(make_event(existing)), None)
+
+    assert cloudfront.calls == []
 
 
 def test_put_with_other_propertys_code_is_forbidden(with_code, existing):

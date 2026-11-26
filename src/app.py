@@ -26,7 +26,13 @@ ACCESS_CODE_HEADER = "x-access-code"
 # Set by CloudFront's router function to the host the viewer called.
 PUBLIC_HOST_HEADER = "x-public-host"
 HOSTNAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$")
-CACHE_CONTROL = "public, max-age=60"
+# Browsers revalidate every time (cheap 304s); CloudFront keeps a copy for up to a day.
+# PUT invalidates CloudFront's copy, so updates are visible at once. The day-long limit
+# bounds how long an expired (deleted) upload can still be served from the cache.
+CACHE_CONTROL = "public, max-age=0, s-maxage=86400"
+# Set by CloudFront's router function to the ID of the distribution that routed the request.
+DISTRIBUTION_ID_HEADER = "x-distribution-id"
+DISTRIBUTION_ID_RE = re.compile(r"^[A-Z0-9]{1,32}$")
 # PUT path, as seen through CloudFront: /<property>/<file>.json
 PUT_PATH_RE = re.compile(
     r"^/(?P<prop>[a-z0-9][a-z0-9_-]{0,62})/(?P<file>[A-Za-z0-9_-][A-Za-z0-9._-]{0,200}\.json)$"
@@ -36,6 +42,11 @@ PUT_PATH_RE = re.compile(
 @lru_cache(maxsize=1)
 def get_s3():
     return boto3.client("s3")
+
+
+@lru_cache(maxsize=1)
+def get_cloudfront():
+    return boto3.client("cloudfront")
 
 
 def hash_code(code: str) -> str:
@@ -154,7 +165,30 @@ def _create(bucket: str, prop: str, body: bytes, base_url: str) -> dict:
     return _response(201, _store(bucket, f"{prop}/{timestamp}-{uuid.uuid4()}.json", body, base_url))
 
 
-def _update(bucket: str, prop: str, body: bytes, path: str, base_url: str) -> dict:
+def _invalidate(event: dict, key: str) -> bool:
+    """Ask CloudFront to drop its cached copy of /<key>. Doesn't wait for it to finish.
+
+    Only possible when the request came through CloudFront (the router function sets
+    the distribution ID). Failure is logged, not raised: the file is already replaced.
+    """
+    distribution_id = (_get_header(event, DISTRIBUTION_ID_HEADER) or "").strip()
+    if not DISTRIBUTION_ID_RE.match(distribution_id):
+        return False
+    try:
+        get_cloudfront().create_invalidation(
+            DistributionId=distribution_id,
+            InvalidationBatch={
+                "Paths": {"Quantity": 1, "Items": [f"/{key}"]},
+                "CallerReference": str(uuid.uuid4()),
+            },
+        )
+    except Exception as err:  # noqa: BLE001 - any failure just means readers wait for the cache
+        print(f"Invalidation of /{key} on {distribution_id} failed: {err!r}")
+        return False
+    return True
+
+
+def _update(event: dict, bucket: str, prop: str, body: bytes, path: str, base_url: str) -> dict:
     match = PUT_PATH_RE.match(path)
     if not match:
         return _response(404, {"error": "not found"})
@@ -163,7 +197,9 @@ def _update(bucket: str, prop: str, body: bytes, path: str, base_url: str) -> di
     key = f"{match['prop']}/{match['file']}"
     if not _exists(bucket, f"{PROPERTIES_PREFIX}{key}"):
         return _response(404, {"error": "not found"})
-    return _response(200, _store(bucket, key, body, base_url))
+    result = _store(bucket, key, body, base_url)
+    result["invalidated"] = _invalidate(event, key)
+    return _response(200, result)
 
 
 def handler(event, context):
@@ -190,4 +226,4 @@ def handler(event, context):
     base_url = _base_url(event)
     if method == "POST":
         return _create(bucket, prop, body, base_url)
-    return _update(bucket, prop, body, event.get("rawPath") or "", base_url)
+    return _update(event, bucket, prop, body, event.get("rawPath") or "", base_url)
