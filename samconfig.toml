@@ -14,4 +14,4 @@ resolve_s3 = true
 confirm_changeset = false
 # To serve uploads from jsonblob.iiif.io, add the ACM certificate ARN (must be in us-east-1):
 # parameter_overrides = "BucketName=iiif-json-blob CertificateArn=arn:aws:acm:us-east-1:ACCOUNT_ID:certificate/ID"
-parameter_overrides = "BucketName=iiif-json-blob"
+parameter_overrides = "BucketName=iiif-json-blob CertificateArn=arn:aws:acm:us-east-1:420715881449:certificate/defa576d-509b-4707-afab-6d2c25a0964d"
