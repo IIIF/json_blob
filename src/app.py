@@ -16,6 +16,7 @@ import re
 import uuid
 from datetime import datetime, timezone
 from functools import lru_cache
+from typing import Any
 
 import boto3
 from botocore.exceptions import ClientError
@@ -82,14 +83,12 @@ def _parse_body(event: dict) -> bytes | None:
     raw = event.get("body") or ""
     try:
         body = base64.b64decode(raw) if event.get("isBase64Encoded") else raw.encode("utf-8")
-        json.loads(body)
+        data = json.loads(body)
     except (ValueError, UnicodeDecodeError):
         return None
-    return body
+    return data
 
-def _isIIIF(data) -> bool:
-    print (data)
-    body = json.loads(data)
+def _isIIIF(body) -> bool:
     if not isinstance(body, dict):
         print (f"Not a dict {type(body).__name__}")
         return False
@@ -141,16 +140,23 @@ def _base_url(event: dict) -> str:
     return ""
 
 
-def _store(bucket: str, key: str, body: bytes, base_url: str) -> dict:
+def _store(bucket: str, key: str, body: dict[str, Any], base_url: str) -> dict:
     """Write body to properties/<key> and return the response payload.
 
     key is relative to properties/, which is also the public URL path
     (CloudFront's S3 origin path is /properties).
     """
+    if base_url:
+        ident = f"{base_url}/{key}"
+        if 'id' in body:
+            body['id'] = ident
+        elif '@id' in body:
+            body['@id'] = ident
+
     get_s3().put_object(
         Bucket=bucket,
         Key=f"{PROPERTIES_PREFIX}{key}",
-        Body=body,
+        Body=json.dumps(body).encode("utf-8"),
         ContentType="application/json",
         CacheControl=CACHE_CONTROL,
     )
@@ -160,9 +166,10 @@ def _store(bucket: str, key: str, body: bytes, base_url: str) -> dict:
     return result
 
 
-def _create(bucket: str, prop: str, body: bytes, base_url: str) -> dict:
+def _create(bucket: str, prop: str, body: dict[str, Any], base_url: str) -> dict:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    return _response(201, _store(bucket, f"{prop}/{timestamp}-{uuid.uuid4()}.json", body, base_url))
+    filename = f"{prop}/{timestamp}-{uuid.uuid4()}.json"
+    return _response(201, _store(bucket, filename, body, base_url))
 
 
 def _invalidate(event: dict, key: str) -> bool:
@@ -188,7 +195,7 @@ def _invalidate(event: dict, key: str) -> bool:
     return True
 
 
-def _update(event: dict, bucket: str, prop: str, body: bytes, path: str, base_url: str) -> dict:
+def _update(event: dict, bucket: str, prop: str, body: dict[str, Any], path: str, base_url: str) -> dict:
     match = PUT_PATH_RE.match(path)
     if not match:
         return _response(404, {"error": "not found"})
@@ -216,6 +223,7 @@ def handler(event, context):
     if prop is None:
         return _response(403, {"error": "invalid access code"})
 
+    # After this body is JSON
     body = _parse_body(event)
     if body is None:
         return _response(400, {"error": "body must be valid JSON"})
