@@ -90,30 +90,25 @@ def _parse_body(event: dict) -> bytes | None:
 
 def _isIIIF(body) -> bool:
     if not isinstance(body, dict):
-        print (f"Not a dict {type(body).__name__}")
-        return False
+        return (False, f"Not a dict {type(body).__name__}")
 
     if "id" in body:
         types = ["Manifest","Collection","AnnotationCollection","AnnotationPage","Annotation"]
         if "type" not in body:
-            print ("No type")
-            return False
+            return (False, "No type")
         if body["type"] not in types:
-            print ("Type not in allowed list")
-            return False
+            return (False, f"Type not in allowed list: {types}")
     elif "@id" in body:   
         types = ["sc:Manifest","sc:Collection","sc:AnnotationList","oa:Annotation"]
         if "@type" not in body:
-            print ("No @type")
-            return False
+            return (False, "No @type")
         if body["@type"] not in types:
-            print ("@Type not in allowed list")
-            return False
+            print ()
+            return (False, f"@Type not in allowed list: {types}")
     else:
-        print ("no id")
-        return False
+        return (False, "No id or @id found")
 
-    return True    
+    return (True,"")    
 
 def _exists(bucket: str, key: str) -> bool:
     try:
@@ -228,8 +223,9 @@ def handler(event, context):
     if body is None:
         return _response(400, {"error": "body must be valid JSON"})
 
-    if not _isIIIF(body):    
-        return _response(400, {"error": "body must be IIIF"})
+    (isValid, reason) = _isIIIF(body)
+    if not isValid:    
+        return _response(400, {"error": f"Body must be IIIF. Failed due to: {reason}"})
 
     base_url = _base_url(event)
     if method == "POST":
