@@ -32,18 +32,21 @@ curl -X POST "https://jsonblob.iiif.io/" \
   -d '{"hello": "world"}'
 ```
 
-From a web page on another origin:
+From Python, using [`requests`](https://pypi.org/project/requests/):
 
-```js
-const resp = await fetch("https://jsonblob.iiif.io/", {
-  method: "POST",
-  headers: { "Content-Type": "application/json", "x-access-code": code },
-  body: JSON.stringify(data),
-});
-const { url } = await resp.json();  // public HTTPS link to the stored JSON
+```python
+import requests
+
+resp = requests.post(
+    "https://jsonblob.iiif.io/",
+    json=data,  # sends the body as JSON with Content-Type: application/json
+    headers={"x-access-code": code},
+)
+resp.raise_for_status()
+url = resp.json()["url"]  # public HTTPS link to the stored JSON
 ```
 
-CloudFront answers CORS preflight requests itself, and any origin can POST; the access code is what protects uploads.
+Browser apps on any origin can POST too: CloudFront answers CORS preflight requests itself. The access code is what protects uploads.
 
 You can also POST straight to the Lambda function URL (the `FunctionUrl` stack output). It works the same way, but until the custom domain is set up its responses contain only `key`, not `url`. The function URL handles its own CORS preflights; to allow only specific origins there, add `AllowedUploadOrigins=https://example.org,https://other.example` to `parameter_overrides` in `samconfig.toml`. That setting doesn't apply to the CloudFront URL.
 
@@ -76,12 +79,12 @@ curl -X PUT "https://jsonblob.iiif.io/acme/<file>.json" \
   -d '{"hello": "again"}'
 ```
 
-```js
-await fetch(url, {
-  method: "PUT",
-  headers: { "Content-Type": "application/json", "x-access-code": code },
-  body: JSON.stringify(data),
-});
+```python
+import requests
+
+resp = requests.put(url, json=data, headers={"x-access-code": code})
+resp.raise_for_status()
+print(resp.json()["invalidated"])  # True once CloudFront's cached copy is being cleared
 ```
 
 | Status | Meaning |
