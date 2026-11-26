@@ -1,7 +1,11 @@
 """Lambda handler: store JSON in S3 under the property its access code maps to.
 
-POST (to the function URL)          creates properties/<property>/<timestamp>-<uuid>.json
+POST (any path; via CloudFront or the function URL)
+                                    creates properties/<property>/<timestamp>-<uuid>.json
 PUT  /<property>/<file>.json        replaces an existing file (routed here by CloudFront)
+
+Responses include "url" when PUBLIC_BASE_URL is set (custom domain) or, failing that,
+when CloudFront's router function passed the viewer's host in x-public-host.
 """
 
 import base64
@@ -19,6 +23,9 @@ from botocore.exceptions import ClientError
 CODES_PREFIX = "codes/"
 PROPERTIES_PREFIX = "properties/"
 ACCESS_CODE_HEADER = "x-access-code"
+# Set by CloudFront's router function to the host the viewer called.
+PUBLIC_HOST_HEADER = "x-public-host"
+HOSTNAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$")
 CACHE_CONTROL = "public, max-age=60"
 # PUT path, as seen through CloudFront: /<property>/<file>.json
 PUT_PATH_RE = re.compile(
@@ -108,7 +115,22 @@ def _exists(bucket: str, key: str) -> bool:
     return True
 
 
-def _store(bucket: str, key: str, body: bytes) -> dict:
+def _base_url(event: dict) -> str:
+    """Public base URL for returned links, or "" if unknown.
+
+    The custom domain (PUBLIC_BASE_URL) wins; otherwise use the CloudFront host
+    the router function passed along. Direct function URL calls have neither.
+    """
+    configured = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
+    if configured:
+        return configured
+    host = (_get_header(event, PUBLIC_HOST_HEADER) or "").strip().lower()
+    if len(host) <= 253 and HOSTNAME_RE.match(host):
+        return f"https://{host}"
+    return ""
+
+
+def _store(bucket: str, key: str, body: bytes, base_url: str) -> dict:
     """Write body to properties/<key> and return the response payload.
 
     key is relative to properties/, which is also the public URL path
@@ -122,18 +144,17 @@ def _store(bucket: str, key: str, body: bytes) -> dict:
         CacheControl=CACHE_CONTROL,
     )
     result = {"key": key}
-    base_url = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
     if base_url:
         result["url"] = f"{base_url}/{key}"
     return result
 
 
-def _create(bucket: str, prop: str, body: bytes) -> dict:
+def _create(bucket: str, prop: str, body: bytes, base_url: str) -> dict:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    return _response(201, _store(bucket, f"{prop}/{timestamp}-{uuid.uuid4()}.json", body))
+    return _response(201, _store(bucket, f"{prop}/{timestamp}-{uuid.uuid4()}.json", body, base_url))
 
 
-def _update(bucket: str, prop: str, body: bytes, path: str) -> dict:
+def _update(bucket: str, prop: str, body: bytes, path: str, base_url: str) -> dict:
     match = PUT_PATH_RE.match(path)
     if not match:
         return _response(404, {"error": "not found"})
@@ -142,7 +163,7 @@ def _update(bucket: str, prop: str, body: bytes, path: str) -> dict:
     key = f"{match['prop']}/{match['file']}"
     if not _exists(bucket, f"{PROPERTIES_PREFIX}{key}"):
         return _response(404, {"error": "not found"})
-    return _response(200, _store(bucket, key, body))
+    return _response(200, _store(bucket, key, body, base_url))
 
 
 def handler(event, context):
@@ -166,6 +187,7 @@ def handler(event, context):
     if not _isIIIF(body):    
         return _response(400, {"error": "body must be IIIF"})
 
+    base_url = _base_url(event)
     if method == "POST":
-        return _create(bucket, prop, body)
-    return _update(bucket, prop, body, event.get("rawPath") or "")
+        return _create(bucket, prop, body, base_url)
+    return _update(bucket, prop, body, event.get("rawPath") or "", base_url)

@@ -64,22 +64,23 @@ Resources:
         SigningProtocol: sigv4
 
   # CloudFront can't route by method, so this viewer-request function does it:
-  # OPTIONS -> answered here (CORS preflight), PUT -> the upload Lambda,
-  # GET/HEAD -> S3, anything else -> 405.
+  # OPTIONS -> answered here (CORS preflight), POST/PUT -> the upload Lambda
+  # (with the viewer's host in x-public-host, so responses can include the
+  # public URL), GET/HEAD -> S3, anything else -> 405.
   RouterFunction:
     Type: AWS::CloudFront::Function
     Properties:
       Name: !Sub "${AWS::StackName}-router"
       AutoPublish: true
       FunctionConfig:
-        Comment: Route PUT to the upload Lambda and answer CORS preflights
+        Comment: Route POST and PUT to the upload Lambda and answer CORS preflights
         Runtime: cloudfront-js-2.0
       FunctionCode: |
         import cf from 'cloudfront';
 
         var CORS = {
           'access-control-allow-origin': { value: '*' },
-          'access-control-allow-methods': { value: 'GET, HEAD, PUT, OPTIONS' },
+          'access-control-allow-methods': { value: 'GET, HEAD, POST, PUT, OPTIONS' },
           'access-control-allow-headers': { value: 'content-type, x-access-code' },
           'access-control-max-age': { value: '86400' }
         };
@@ -90,7 +91,12 @@ Resources:
           if (method === 'OPTIONS') {
             return { statusCode: 204, statusDescription: 'No Content', headers: CORS };
           }
-          if (method === 'PUT') {
+          if (method === 'POST' || method === 'PUT') {
+            // Always overwrite, so a viewer can't choose the host in returned URLs.
+            delete request.headers['x-public-host'];
+            if (request.headers.host) {
+              request.headers['x-public-host'] = { value: request.headers.host.value };
+            }
             cf.selectRequestOriginById('UploadFunctionOrigin');
             return request;
           }
@@ -101,7 +107,7 @@ Resources:
             statusCode: 405,
             statusDescription: 'Method Not Allowed',
             headers: {
-              'allow': { value: 'GET, HEAD, PUT, OPTIONS' },
+              'allow': { value: 'GET, HEAD, POST, PUT, OPTIONS' },
               'access-control-allow-origin': { value: '*' }
             }
           };
@@ -116,7 +122,7 @@ Resources:
         Name: !Sub "${AWS::StackName}-forward-upload-headers"
         HeadersConfig:
           HeaderBehavior: whitelist
-          Headers: [content-type, x-access-code]
+          Headers: [content-type, x-access-code, x-public-host]
         CookiesConfig:
           CookieBehavior: none
         QueryStringsConfig:
@@ -132,7 +138,7 @@ Resources:
           AccessControlAllowHeaders:
             Items: [content-type, x-access-code]
           AccessControlAllowMethods:
-            Items: [GET, HEAD, PUT, OPTIONS]
+            Items: [GET, HEAD, POST, PUT, OPTIONS]
           AccessControlAllowOrigins:
             Items: ["*"]
           AccessControlMaxAgeSec: 86400
@@ -171,8 +177,8 @@ Resources:
         DefaultCacheBehavior:
           TargetOriginId: DataBucketOrigin
           ViewerProtocolPolicy: redirect-to-https
-          # CloudFront needs the full method set to allow PUT; RouterFunction
-          # rejects POST/PATCH/DELETE with 405.
+          # CloudFront needs the full method set to allow POST/PUT; RouterFunction
+          # rejects PATCH/DELETE with 405.
           AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
           CachedMethods: [GET, HEAD]
           Compress: true
@@ -214,7 +220,8 @@ Resources:
         Variables:
           BUCKET_NAME: !Ref DataBucket
           # Can't reference the distribution here (it depends on this function's URL),
-          # so responses include "url" only once the custom domain is configured.
+          # so without a custom domain the handler builds "url" from the x-public-host
+          # header the router function adds (requests through CloudFront only).
           PUBLIC_BASE_URL: !If [HasCustomDomain, !Sub "https://${PublicDomainName}", ""]
       FunctionUrlConfig:
         AuthType: NONE

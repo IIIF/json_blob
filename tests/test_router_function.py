@@ -22,10 +22,14 @@ var cf = { selectRequestOriginById: function (id) { selected.push(id); } };
 var results = {};
 ['GET', 'HEAD', 'PUT', 'OPTIONS', 'POST', 'DELETE', 'PATCH'].forEach(function (m) {
   selected = [];
-  var request = { method: m, uri: '/acme/x.json', headers: {} };
+  var request = { method: m, uri: '/acme/x.json', headers: {
+    host: { value: 'd111.cloudfront.net' },
+    'x-public-host': { value: 'spoofed.example' }
+  } };
   var out = handler({ request: request });
   results[m] = { passthrough: out === request, status: out.statusCode || null,
-                 headers: out === request ? null : out.headers, origins: selected };
+                 headers: out === request ? null : out.headers, origins: selected,
+                 forwarded: out === request ? out.headers : null };
 });
 console.log(JSON.stringify(results));
 """
@@ -45,23 +49,39 @@ def results():
 
 @pytest.mark.parametrize("method", ["GET", "HEAD"])
 def test_reads_go_to_s3(results, method):
-    assert results[method] == {"passthrough": True, "status": None, "headers": None, "origins": []}
+    r = results[method]
+    assert (r["passthrough"], r["status"], r["headers"], r["origins"]) == (True, None, None, [])
+    # Reads are left alone: the router doesn't rewrite headers for S3.
+    assert r["forwarded"]["x-public-host"] == {"value": "spoofed.example"}
 
 
-def test_put_goes_to_upload_function(results):
-    assert results["PUT"]["passthrough"] is True
-    assert results["PUT"]["origins"] == ["UploadFunctionOrigin"]
+@pytest.mark.parametrize("method", ["POST", "PUT"])
+def test_writes_go_to_upload_function(results, method):
+    assert results[method]["passthrough"] is True
+    assert results[method]["origins"] == ["UploadFunctionOrigin"]
+
+
+@pytest.mark.parametrize("method", ["POST", "PUT"])
+def test_writes_pass_viewer_host_not_spoofed_header(results, method):
+    assert results[method]["forwarded"]["x-public-host"] == {"value": "d111.cloudfront.net"}
 
 
 def test_options_answers_preflight(results):
     opts = results["OPTIONS"]
     assert opts["status"] == 204
     assert opts["headers"]["access-control-allow-origin"] == {"value": "*"}
+    assert "POST" in opts["headers"]["access-control-allow-methods"]["value"]
     assert "PUT" in opts["headers"]["access-control-allow-methods"]["value"]
     assert "x-access-code" in opts["headers"]["access-control-allow-headers"]["value"]
 
 
-@pytest.mark.parametrize("method", ["POST", "DELETE", "PATCH"])
+def test_public_host_header_is_forwarded_to_origin():
+    template = yaml_parse(TEMPLATE.read_text())
+    policy = template["Resources"]["ForwardUploadHeadersPolicy"]["Properties"]
+    assert "x-public-host" in policy["OriginRequestPolicyConfig"]["HeadersConfig"]["Headers"]
+
+
+@pytest.mark.parametrize("method", ["DELETE", "PATCH"])
 def test_other_methods_rejected(results, method):
     assert results[method]["status"] == 405
     assert results[method]["origins"] == []

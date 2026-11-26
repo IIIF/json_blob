@@ -100,6 +100,41 @@ def test_url_omitted_without_public_base_url(with_code, monkeypatch):
     assert "url" not in json.loads(resp["body"])
 
 
+def test_url_from_cloudfront_host_without_public_base_url(with_code, monkeypatch):
+    monkeypatch.delenv("PUBLIC_BASE_URL")
+
+    resp = app.handler(event(headers={"x-access-code": CODE, "x-public-host": "D111.cloudfront.net"}), None)
+
+    assert resp["statusCode"] == 201
+    result = json.loads(resp["body"])
+    assert result["url"] == f"https://d111.cloudfront.net/{result['key']}"
+
+
+def test_public_base_url_wins_over_cloudfront_host(with_code):
+    resp = app.handler(event(headers={"x-access-code": CODE, "x-public-host": "d111.cloudfront.net"}), None)
+
+    result = json.loads(resp["body"])
+    assert result["url"] == f"{PUBLIC_BASE_URL}/{result['key']}"
+
+
+@pytest.mark.parametrize("host", ["", "evil.com/x", "a b.com", "localhost", "x.com:8080", "-x.com"])
+def test_invalid_cloudfront_host_is_ignored(with_code, monkeypatch, host):
+    monkeypatch.delenv("PUBLIC_BASE_URL")
+
+    resp = app.handler(event(headers={"x-access-code": CODE, "x-public-host": host}), None)
+
+    assert resp["statusCode"] == 201
+    assert "url" not in json.loads(resp["body"])
+
+
+@pytest.mark.parametrize("path", ["/", "/ai2026", "/other/thing.json", ""])
+def test_post_path_is_ignored(with_code, path):
+    resp = app.handler(event(path=path), None)
+
+    assert resp["statusCode"] == 201
+    assert KEY_RE.match(json.loads(resp["body"])["key"])
+
+
 def test_base64_body_is_decoded(with_code):
     manifest = {"id": "https://example.com","type": "Manifest"}
     encoded = base64.b64encode(json.dumps(manifest).encode("utf-8")).decode("ascii")
@@ -130,6 +165,17 @@ def test_put_replaces_existing_file(with_code, existing):
     obj = with_code.head_object(Bucket=BUCKET, Key=f"properties/{existing}")
     assert obj["CacheControl"] == "public, max-age=60"
     assert obj["ContentType"] == "application/json"
+
+
+def test_put_url_from_cloudfront_host(with_code, existing, monkeypatch):
+    monkeypatch.delenv("PUBLIC_BASE_URL")
+    ev = put_event(f"/{existing}")
+    ev["headers"]["x-public-host"] = "d111.cloudfront.net"
+
+    resp = app.handler(ev, None)
+
+    assert resp["statusCode"] == 200
+    assert json.loads(resp["body"])["url"] == f"https://d111.cloudfront.net/{existing}"
 
 
 def test_put_with_other_propertys_code_is_forbidden(with_code, existing):

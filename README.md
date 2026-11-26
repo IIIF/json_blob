@@ -23,8 +23,10 @@ uv run sam build
 
 ## Calling the function
 
+POST new JSON to the public URL, the same one uploads are read from: `https://jsonblob.iiif.io/`, or the `PublicBaseUrl` stack output until the custom domain is set up. The path is ignored; the access code decides which property the file goes into.
+
 ```sh
-curl -X POST "<FunctionUrl>" \
+curl -X POST "https://jsonblob.iiif.io/" \
   -H "x-access-code: <code>" \
   -H "Content-Type: application/json" \
   -d '{"hello": "world"}'
@@ -33,7 +35,7 @@ curl -X POST "<FunctionUrl>" \
 From a web page on another origin:
 
 ```js
-const resp = await fetch(FUNCTION_URL, {
+const resp = await fetch("https://jsonblob.iiif.io/", {
   method: "POST",
   headers: { "Content-Type": "application/json", "x-access-code": code },
   body: JSON.stringify(data),
@@ -41,20 +43,22 @@ const resp = await fetch(FUNCTION_URL, {
 const { url } = await resp.json();  // public HTTPS link to the stored JSON
 ```
 
-The function URL handles CORS preflight requests. By default any origin can POST; the access code is what protects uploads. To allow only specific origins, add `AllowedUploadOrigins=https://example.org,https://other.example` to `parameter_overrides` in `samconfig.toml`.
+CloudFront answers CORS preflight requests itself, and any origin can POST; the access code is what protects uploads.
+
+You can also POST straight to the Lambda function URL (the `FunctionUrl` stack output). It works the same way, but until the custom domain is set up its responses contain only `key`, not `url`. The function URL handles its own CORS preflights; to allow only specific origins there, add `AllowedUploadOrigins=https://example.org,https://other.example` to `parameter_overrides` in `samconfig.toml`. That setting doesn't apply to the CloudFront URL.
 
 | Status | Meaning |
 | --- | --- |
-| 201 | Stored. The response is `{"key": "<property>/<file>.json", "url": "https://jsonblob.iiif.io/<property>/<file>.json"}` |
-| 400 | The body isn't valid JSON |
+| 201 | Stored. The response is `{"key": "<property>/<file>.json", "url": "https://jsonblob.iiif.io/<property>/<file>.json"}`. Before the custom domain is set up, `url` uses the `*.cloudfront.net` host you POSTed to |
+| 400 | The body isn't valid JSON, or isn't a IIIF resource |
 | 401 | The `x-access-code` header is missing |
 | 403 | The code isn't recognised |
 
-`FunctionUrl` is a stack output: `aws cloudformation describe-stacks --stack-name json-blob --query "Stacks[0].Outputs"`.
+`PublicBaseUrl` and `FunctionUrl` are stack outputs: `aws cloudformation describe-stacks --stack-name json-blob --query "Stacks[0].Outputs"`.
 
 ## Reading uploads
 
-Uploads are served over HTTPS by CloudFront at `https://jsonblob.iiif.io/<property>/<file>.json` (the `url` field returned by an upload), with `Access-Control-Allow-Origin: *`, so IIIF viewers and other browser apps on any origin can fetch them. The URL path is the S3 key without the `properties/` prefix, because CloudFront's origin path is `/properties`. Until a certificate is configured (see below), files are served from the distribution's `https://dxxxx.cloudfront.net` domain (the `PublicBaseUrl` output), and upload responses contain only `key`, not `url`.
+Uploads are served over HTTPS by CloudFront at `https://jsonblob.iiif.io/<property>/<file>.json` (the `url` field returned by an upload), with `Access-Control-Allow-Origin: *`, so IIIF viewers and other browser apps on any origin can fetch them. The URL path is the S3 key without the `properties/` prefix, because CloudFront's origin path is `/properties`. Until a certificate is configured (see below), files are served from the distribution's `https://dxxxx.cloudfront.net` domain (the `PublicBaseUrl` output).
 
 - The bucket itself stays private (Block Public Access is on). CloudFront reads it through Origin Access Control, only under `properties/`, so `codes/` and `registry/` can't be reached at all, and nobody can list folder contents.
 - Anyone who has a URL can read that file. The filenames include a random UUID, so they can't be guessed.
@@ -87,12 +91,12 @@ await fetch(url, {
 | 401 | The `x-access-code` header is missing |
 | 403 | The code isn't recognised, or it belongs to a different property |
 | 404 | No such file. PUT only updates; use POST to create new files |
-| 405 | Methods other than GET, HEAD, PUT and OPTIONS aren't allowed on the public URL |
+| 405 | Methods other than GET, HEAD, POST, PUT and OPTIONS aren't allowed on the public URL |
 
 - Readers see the new version within about 60 seconds, because of the cache lifetime.
 - A PUT counts as a new write, so it restarts the file's 30-day expiry.
-- Browser PUTs from any origin work: CloudFront answers the CORS preflight itself.
-- How it works: CloudFront can't route by HTTP method, so a CloudFront Function (`RouterFunction` in `template.yaml`) sends PUTs to the upload Lambda's function URL and everything else to S3. `tests/test_router_function.py` runs its logic under Node. To test it in CloudFront's real runtime after deploying, use `aws cloudfront test-function`.
+- Browser POSTs and PUTs from any origin work: CloudFront answers the CORS preflight itself.
+- How it works: CloudFront can't route by HTTP method, so a CloudFront Function (`RouterFunction` in `template.yaml`) sends POSTs and PUTs to the upload Lambda's function URL and GETs and HEADs to S3. For POSTs and PUTs it also passes the host the caller used in an `x-public-host` header, which the Lambda uses to build `url` when no custom domain is configured. `tests/test_router_function.py` runs its logic under Node. To test it in CloudFront's real runtime after deploying, use `aws cloudfront test-function`.
 
 ### Custom domain (jsonblob.iiif.io)
 
